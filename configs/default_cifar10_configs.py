@@ -69,4 +69,21 @@ def get_default_configs():
   config.seed = 42
   config.device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
+  config.vae_config = vae_config = ml_collections.ConfigDict()
+  vae_config.batch_size = 64
+  vae_config.max_epochs = 1
+  vae_config.snapshot_sampling = True
+
+  vae_config.optimizer = vae_optimizer = ml_collections.ConfigDict()
+  vae_optimizer.lr = 0.005
+  vae_optimizer.weight_decay = 0.0
+  vae_optimizer.scheduler_gamma = 0.95
+  vae_optimizer.kld_weight = 0.00025
+
+  vae_config.data = vae_data = ml_collections.ConfigDict()
+  vae_config.batch_size = 64
+  vae_data.data.image_size = 16
+  vae_data.data.in_channels = 3
+  vae_data.data.latent_dims = vae_data.data.image_size * vae_data.data.image_size
+
   return config

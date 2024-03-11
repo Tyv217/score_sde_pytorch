@@ -18,6 +18,7 @@
 import jax
 import tensorflow as tf
 import tensorflow_datasets as tfds
+import torch
 
 
 def get_data_scaler(config):
@@ -194,3 +195,7 @@ def get_dataset(config, uniform_dequantization=False, evaluation=False):
   train_ds = create_dataset(dataset_builder, train_split_name)
   eval_ds = create_dataset(dataset_builder, eval_split_name)
   return train_ds, eval_ds, dataset_builder
+
+def get_vae_training_dataset(ds, batch_size, device, train = False):
+  ds = [torch.from_numpy(it['image']._numpy()).to(device).float() for it in iter(ds)]
+  return torch.utils.data.Dataloader(ds, batch_size = batch_size, shuffle = train)

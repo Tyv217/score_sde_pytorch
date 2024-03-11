@@ -24,6 +24,7 @@ import time
 import numpy as np
 import tensorflow as tf
 import tensorflow_gan as tfgan
+import pytorch_lightning as pl
 import logging
 # Keep the import below for registering all model definitions
 from models import ddpm, ncsnv2, ncsnpp
@@ -61,7 +62,17 @@ def train(config, workdir):
   tf.io.gfile.makedirs(tb_dir)
   writer = tensorboard.SummaryWriter(tb_dir)
 
+  vae_config = config.get("vae_config", None) 
+
   # Initialize model.
+  if vae_config is not None:
+    vae = mutils.create_model(vae_config)
+    vae_trainer = pl.Trainer(
+      accelerator = "auto",
+      max_epochs = vae_config["max_epochs"],
+      enable_checkpointing = False
+    )
+    
   score_model = mutils.create_model(config)
   ema = ExponentialMovingAverage(score_model.parameters(), decay=config.model.ema_rate)
   optimizer = losses.get_optimizer(config, score_model.parameters())
@@ -85,6 +96,25 @@ def train(config, workdir):
   # Create data normalizer and its inverse
   scaler = datasets.get_data_scaler(config)
   inverse_scaler = datasets.get_data_inverse_scaler(config)
+
+  if vae_config is not None:
+    train_dl = datasets.get_vae_training_dataset(train_ds, batch_size = vae_config["batch_size"], device = config["device"], train = True)
+    val_dl = datasets.get_vae_training_dataset(eval_ds, batch_size = vae_config["batch_size"], device = config["device"])
+    vae_trainer.fit(vae, train_dl, val_dl)
+    torch.save(vae, os.path.join(checkpoint_dir, f'vae.pth'))
+    vae.freeze()
+    if vae_config.snapshot_sampling:
+      val_it = iter(val_dl)
+      for i in config.vae_config["num_samples"]:
+        sample = next(val_it)
+        with tf.io.gfile.GFile(
+            os.path.join(sample_dir, f"vae_original_{i}.png"), "wb") as fout:
+          save_image(sample, fout)
+        sample = vae.encode_images(torch.unsqueeze(sample, dim = 0))
+        sample = np.clip(sample.permute(0, 2, 3, 1).cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        with tf.io.gfile.GFile(
+            os.path.join(sample_dir, f"vae_encoded_{i}.png"), "wb") as fout:
+          save_image(sample, fout)
 
   # Setup SDEs
   if config.training.sde.lower() == 'vpsde':
@@ -113,8 +143,12 @@ def train(config, workdir):
 
   # Building sampling functions
   if config.training.snapshot_sampling:
-    sampling_shape = (config.training.batch_size, config.data.num_channels,
-                      config.data.image_size, config.data.image_size)
+    if vae_config is not None:
+      sampling_shape = (vae_config.batch_size, 1,
+                        vae_config.data.image_size, vae_config.data.image_size)
+    else:
+      sampling_shape = (config.training.batch_size, config.data.num_channels,
+                        config.data.image_size, config.data.image_size)
     sampling_fn = sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, sampling_eps)
 
   num_train_steps = config.training.n_iters
@@ -126,6 +160,7 @@ def train(config, workdir):
     # Convert data to JAX arrays and normalize them. Use ._numpy() to avoid copy.
     batch = torch.from_numpy(next(train_iter)['image']._numpy()).to(config.device).float()
     batch = batch.permute(0, 3, 1, 2)
+    batch = vae.encode_images(batch)
     batch = scaler(batch)
     # Execute one training step
     loss = train_step_fn(state, batch)
@@ -141,6 +176,7 @@ def train(config, workdir):
     if step % config.training.eval_freq == 0:
       eval_batch = torch.from_numpy(next(eval_iter)['image']._numpy()).to(config.device).float()
       eval_batch = eval_batch.permute(0, 3, 1, 2)
+      eval_batch = vae.encode_images(eval_batch)
       eval_batch = scaler(eval_batch)
       eval_loss = eval_step_fn(state, eval_batch)
       logging.info("step: %d, eval_loss: %.5e" % (step, eval_loss.item()))
@@ -157,6 +193,8 @@ def train(config, workdir):
         ema.store(score_model.parameters())
         ema.copy_to(score_model.parameters())
         sample, n = sampling_fn(score_model)
+        sample.to(vae.device)
+        sample = vae.decode_images(sample)
         ema.restore(score_model.parameters())
         this_sample_dir = os.path.join(sample_dir, "iter_{}".format(step))
         tf.io.gfile.makedirs(this_sample_dir)
@@ -190,7 +228,7 @@ def evaluate(config,
   # Build data pipeline
   train_ds, eval_ds, _ = datasets.get_dataset(config,
                                               uniform_dequantization=config.data.uniform_dequantization,
-                                              evaluation=True)
+                                              evaluation=True)  
 
   # Create data normalizer and its inverse
   scaler = datasets.get_data_scaler(config)
@@ -201,6 +239,9 @@ def evaluate(config,
   optimizer = losses.get_optimizer(config, score_model.parameters())
   ema = ExponentialMovingAverage(score_model.parameters(), decay=config.model.ema_rate)
   state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)
+  vae_config = config.get("vae_config", None)
+  if vae_config is not None:
+    vae = mutils.create_model(vae_config)
 
   checkpoint_dir = os.path.join(workdir, "checkpoints")
 
@@ -233,6 +274,7 @@ def evaluate(config,
   # Create data loaders for likelihood evaluation. Only evaluate on uniformly dequantized data
   train_ds_bpd, eval_ds_bpd, _ = datasets.get_dataset(config,
                                                       uniform_dequantization=True, evaluation=True)
+  
   if config.eval.bpd_dataset.lower() == 'train':
     ds_bpd = train_ds_bpd
     bpd_num_repeats = 1
@@ -249,10 +291,14 @@ def evaluate(config,
 
   # Build the sampling function when sampling is enabled
   if config.eval.enable_sampling:
-    sampling_shape = (config.eval.batch_size,
-                      config.data.num_channels,
-                      config.data.image_size, config.data.image_size)
+    if vae_config is not None:
+      sampling_shape = (vae_config.batch_size, 1,
+                        vae_config.data.image_size, vae_config.data.image_size)
+    else:
+      sampling_shape = (config.training.batch_size, config.data.num_channels,
+                        config.data.image_size, config.data.image_size)
     sampling_fn = sampling.get_sampling_fn(config, sde, sampling_shape, inverse_scaler, sampling_eps)
+
 
   # Use inceptionV3 for images with resolution higher than 256.
   inceptionv3 = config.data.image_size >= 256
@@ -282,6 +328,7 @@ def evaluate(config,
         time.sleep(120)
         state = restore_checkpoint(ckpt_path, state, device=config.device)
     ema.copy_to(score_model.parameters())
+    vae = torch.load(os.path.join(checkpoint_dir, f'vae.pth'))
     # Compute the loss function on the full evaluation dataset if loss computation is enabled
     if config.eval.enable_loss:
       all_losses = []
@@ -289,6 +336,7 @@ def evaluate(config,
       for i, batch in enumerate(eval_iter):
         eval_batch = torch.from_numpy(batch['image']._numpy()).to(config.device).float()
         eval_batch = eval_batch.permute(0, 3, 1, 2)
+        eval_batch = vae.encode_images(eval_batch)
         eval_batch = scaler(eval_batch)
         eval_loss = eval_step(state, eval_batch)
         all_losses.append(eval_loss.item())
@@ -311,6 +359,7 @@ def evaluate(config,
           batch = next(bpd_iter)
           eval_batch = torch.from_numpy(batch['image']._numpy()).to(config.device).float()
           eval_batch = eval_batch.permute(0, 3, 1, 2)
+          eval_batch = vae.encode_images(eval_batch)
           eval_batch = scaler(eval_batch)
           bpd = likelihood_fn(score_model, eval_batch)[0]
           bpd = bpd.detach().cpu().numpy().reshape(-1)
@@ -337,6 +386,7 @@ def evaluate(config,
           eval_dir, f"ckpt_{ckpt}")
         tf.io.gfile.makedirs(this_sample_dir)
         samples, n = sampling_fn(score_model)
+        samples = vae.decode_images(samples)
         samples = np.clip(samples.permute(0, 2, 3, 1).cpu().numpy() * 255., 0, 255).astype(np.uint8)
         samples = samples.reshape(
           (-1, config.data.image_size, config.data.image_size, config.data.num_channels))

@@ -88,10 +88,10 @@ def get_ddpm_params(config):
 def create_model(config):
   """Create the score model."""
   model_name = config.model.name
-  score_model = get_model(model_name)(config)
-  score_model = score_model.to(config.device)
-  score_model = torch.nn.DataParallel(score_model)
-  return score_model
+  model = get_model(model_name)(config)
+  model = model.to(config.device)
+  model = torch.nn.DataParallel(model)
+  return model
 
 
 def get_model_fn(model, train=False):
