@@ -65,6 +65,9 @@ def train(config, workdir):
   vae_config = config.get("vae_config", None) 
 
   # Initialize model.
+  logging.debug(
+    f"Initializing models."
+  )
   if vae_config is not None:
     vae = mutils.create_model(vae_config)
     vae_trainer = pl.Trainer(
@@ -89,6 +92,9 @@ def train(config, workdir):
   initial_step = int(state['step'])
 
   # Build data iterators
+  logging.debug(
+    f"Creating datasets"
+  )
   train_ds, eval_ds, _ = datasets.get_dataset(config,
                                               uniform_dequantization=config.data.uniform_dequantization)
   train_iter = iter(train_ds)  # pytype: disable=wrong-arg-types
@@ -98,11 +104,22 @@ def train(config, workdir):
   inverse_scaler = datasets.get_data_inverse_scaler(config)
 
   if vae_config is not None:
+    logging.debug(
+      f"Creating VAE datasets"
+    )
     train_dl = datasets.get_vae_training_dataset(train_ds, batch_size = vae_config["batch_size"], device = config["device"], train = True)
     val_dl = datasets.get_vae_training_dataset(eval_ds, batch_size = vae_config["batch_size"], device = config["device"])
+
+    logging.debug(
+      f"Starting VAE Training."
+    )
     vae_trainer.fit(vae, train_dl, val_dl)
     torch.save(vae, os.path.join(checkpoint_dir, f'vae.pth'))
     vae.freeze()
+    
+    logging.debug(
+      f"Generating VAE samples."
+    )
     if vae_config.snapshot_sampling:
       val_it = iter(val_dl)
       for i in config.vae_config["num_samples"]:
