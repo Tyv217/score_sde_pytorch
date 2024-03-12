@@ -4,7 +4,6 @@ import torch, torchvision
 import utils
 
 import numpy as np
-import pytorch_lightning as pl
 
 from torch import nn
 from typing import List
@@ -12,7 +11,7 @@ from torch.nn import functional as F
 from torch import Tensor as Tensor
 
 @utils.register_model(name='vae')
-class VAE(pl.LightningModule):
+class VAE(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
